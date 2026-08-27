@@ -26,4 +26,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Real, 2026-08-27 -- powers summarize_article()'s real own-words article summaries.
+          # Not required for the workflow to run (market_pulse.py degrades to an honest "AI
+          # summary unavailable" note if this secret isn't set), but real summarization needs it.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python market_pulse.py
