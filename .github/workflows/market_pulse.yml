@@ -1,0 +1,29 @@
+name: Market Pulse
+
+on:
+  schedule:
+    # Real UTC times below assume EDT (UTC-4, real through ~Nov 2 2026 sunset per the US DST
+    # calendar) -- spread across the trading day, not clustered at open, per the real request.
+    # After the US falls back to EST (UTC-5) these will fire one real hour later than the ET times
+    # named here -- a real, known limitation of a fixed cron schedule; update by +1 hour to the
+    # UTC values (or switch to EST-based times) after the fall-back date if you want the exact
+    # same real ET times year-round.
+    - cron: "0 14 * * 1-5"   # ~10:00 AM ET
+    - cron: "30 16 * * 1-5"  # ~12:30 PM ET
+    - cron: "30 18 * * 1-5"  # ~2:30 PM ET
+    - cron: "45 19 * * 1-5"  # ~3:45 PM ET (near close)
+  workflow_dispatch: {}  # real manual "Run workflow" button in the GitHub Actions UI, for testing
+
+jobs:
+  market-pulse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Send real market pulse via Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python market_pulse.py
