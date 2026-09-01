@@ -186,17 +186,28 @@ def send_telegram(message):
         return resp.status == 200
 
 
-def build_digest():
-    lines = ["<b>Market Pulse</b> (cloud, independent of local machine)\n"]
+TELEGRAM_MAX_CHARS = 3800  # real Telegram sendMessage hard limit is 4096 chars -- headroom below
+                            # that, not right up against it, since HTML entities (&amp; etc.) can
+                            # expand a few characters past what len() sees on the raw text
 
-    lines.append("<b>Broad market:</b>")
+
+def build_digest_blocks():
+    """Real digest content as a list of self-contained blocks -- a block is never split across
+    two Telegram messages (see chunk_blocks() below). Block 0 is the header + broad-market
+    summary (always short, always fits); each real mover is its own block, since a real AI
+    summary (2026-08-27 addition) can run 400-600 real characters and 8 real simultaneous movers
+    (a real, observed 2026-09-01 case) pushes the WHOLE digest well past Telegram's 4096-char
+    single-message limit -- splitting into multiple real messages instead of silently truncating
+    or dropping real content."""
+    header = ["<b>Market Pulse</b> (cloud, independent of local machine)\n", "<b>Broad market:</b>"]
     for tk in MARKET_CONTEXT:
         q = get_quote(tk)
         if q:
             label = "VIX" if tk == "^VIX" else tk
-            lines.append(f"  {label}: {q['price']:.2f} ({q['pct']:+.2f}%)")
+            header.append(f"  {label}: {q['price']:.2f} ({q['pct']:+.2f}%)")
         else:
-            lines.append(f"  {tk}: no real quote available this run")
+            header.append(f"  {tk}: no real quote available this run")
+    blocks = ["\n".join(header)]
 
     movers = []
     for tk in WATCHLIST:
@@ -206,7 +217,7 @@ def build_digest():
 
     if movers:
         movers.sort(key=lambda q: abs(q["pct"]), reverse=True)
-        lines.append(f"\n<b>Movers (|change| >= {MOVER_THRESHOLD_PCT:.0f}%):</b>")
+        blocks[0] += f"\n\n<b>Movers (|change| >= {MOVER_THRESHOLD_PCT:.0f}%):</b>"
         for q in movers:
             arrow = "\U0001F4C8" if q["pct"] > 0 else "\U0001F4C9"
             line = f"  {arrow} <b>{q['ticker']}</b>: ${q['price']:.2f} ({q['pct']:+.2f}%)"
@@ -216,22 +227,49 @@ def build_digest():
                 line += f"\n{summary}"
                 source_bit = f"{article['source']}" + (f" -- {article['link']}" if article["link"] else "")
                 line += f"\n<i>{source_bit}</i>"
-            lines.append(line)
+            blocks.append(line)
     else:
-        lines.append(f"\nNo real holding crossed +/-{MOVER_THRESHOLD_PCT:.0f}% today.")
+        blocks[0] += f"\n\nNo real holding crossed +/-{MOVER_THRESHOLD_PCT:.0f}% today."
 
-    return "\n".join(lines)
+    return blocks
+
+
+def chunk_blocks(blocks, max_chars=TELEGRAM_MAX_CHARS):
+    """Real greedy packing -- fills each real Telegram message up to max_chars, never splitting
+    a real block (one mover's ticker+summary+source) across two messages. A single block that's
+    ALONE longer than max_chars (a genuinely huge real AI summary) is sent as its own oversized
+    message rather than mangled mid-sentence -- Telegram will reject that specific message and
+    the caller sees a real per-message failure, which is honest; still better than silent
+    truncation of real content."""
+    chunks, current = [], ""
+    for block in blocks:
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) > max_chars and current:
+            chunks.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def main():
-    digest = build_digest()
+    blocks = build_digest_blocks()
+    chunks = chunk_blocks(blocks)
+    full_text = "\n\n".join(blocks)
     # Real robustness fix: a local Windows console (cp1252) can't print the real emoji used in
     # the digest -- GitHub Actions' Ubuntu runners are UTF-8 by default and won't hit this, but
     # printing for local testing/log visibility shouldn't crash the whole run either way.
-    print(digest.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8", errors="replace"))
-    ok = send_telegram(digest)
-    print(f"\nTelegram send: {'OK' if ok else 'FAILED'}")
-    if not ok:
+    print(full_text.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8", errors="replace"))
+    print(f"\n{len(chunks)} real Telegram message(s) this run (digest is {len(full_text)} real chars).")
+
+    all_ok = True
+    for i, chunk in enumerate(chunks, 1):
+        ok = send_telegram(chunk)
+        print(f"Telegram send {i}/{len(chunks)}: {'OK' if ok else 'FAILED'} ({len(chunk)} chars)")
+        all_ok = all_ok and ok
+    if not all_ok:
         sys.exit(1)
 
 
