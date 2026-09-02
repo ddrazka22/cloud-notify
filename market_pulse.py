@@ -34,6 +34,13 @@ MOVER THRESHOLD: a ticker's real day-change is flagged when it crosses +/-3% -- 
 Real secrets (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ANTHROPIC_API_KEY) come from GitHub Actions
 repo secrets, set via the GitHub UI (Settings -> Secrets and variables -> Actions) -- never
 hardcoded here, never committed to the repo.
+
+CHAT SPLITTING (2026-09-02, user-requested -- "separate the telegrams into different chats"):
+this script sends up to three real, independent messages per run instead of one combined digest --
+broad-market context to TELEGRAM_CHAT_ID_MARKET_NEWS, mover price/% lines to
+TELEGRAM_CHAT_ID_MOVEMENTS, and each mover's real news summary to TELEGRAM_CHAT_ID_STOCK_NEWS. Any
+of those three env vars that isn't set as a repo secret falls back to the original TELEGRAM_CHAT_ID
+(same bot, same default chat) so nothing breaks before the user creates the new chats.
 """
 
 import os
@@ -165,17 +172,34 @@ def summarize_article(ticker, pct, article):
         return f"(AI summary unavailable this run -- {e})"
 
 
-def send_telegram(message):
-    """Real Telegram Bot API send -- the same real bot/chat this project already uses locally,
-    just called directly here (no dependency on the local telegram_alert.py module or the local
-    machine at all).
+CHANNEL_ENV_VARS = {
+    "market_news": "TELEGRAM_CHAT_ID_MARKET_NEWS",
+    "movements": "TELEGRAM_CHAT_ID_MOVEMENTS",
+    "stock_news": "TELEGRAM_CHAT_ID_STOCK_NEWS",
+}
+
+
+def _resolve_chat_id(channel):
+    env_var = CHANNEL_ENV_VARS.get(channel)
+    chat_id = os.environ.get(env_var) if env_var else None
+    return chat_id or os.environ.get("TELEGRAM_CHAT_ID")
+
+
+def send_telegram(message, channel=None):
+    """Real Telegram Bot API send -- the same real bot this project already uses locally, just
+    called directly here (no dependency on the local telegram_alert.py module or the local
+    machine at all). `channel` (see CHANNEL_ENV_VARS) routes to a dedicated chat if its repo
+    secret is set, otherwise falls back to TELEGRAM_CHAT_ID.
 
     disable_web_page_preview (2026-08-27, user-requested "remove images from notifications"):
     Telegram auto-unfurls any real URL in the message text into a thumbnail/image preview by
     default -- this is the real, actual source of images in these notifications, not a photo
     attachment anywhere in this code (there never was one). Text-only, real fix."""
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    chat_id = os.environ["TELEGRAM_CHAT_ID"]
+    chat_id = _resolve_chat_id(channel)
+    if not chat_id:
+        print(f"  ! no chat id available for channel={channel!r} -- message not sent", file=sys.stderr)
+        return False
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = json.dumps({
         "chat_id": chat_id, "text": message, "parse_mode": "HTML",
@@ -192,13 +216,15 @@ TELEGRAM_MAX_CHARS = 3800  # real Telegram sendMessage hard limit is 4096 chars 
 
 
 def build_digest_blocks():
-    """Real digest content as a list of self-contained blocks -- a block is never split across
-    two Telegram messages (see chunk_blocks() below). Block 0 is the header + broad-market
-    summary (always short, always fits); each real mover is its own block, since a real AI
-    summary (2026-08-27 addition) can run 400-600 real characters and 8 real simultaneous movers
-    (a real, observed 2026-09-01 case) pushes the WHOLE digest well past Telegram's 4096-char
-    single-message limit -- splitting into multiple real messages instead of silently truncating
-    or dropping real content."""
+    """Real digest content split into three real, independent channels (2026-09-02, user-
+    requested chat separation) -- broad-market context, mover price/% lines, and mover news
+    summaries route to different Telegram chats (see CHANNEL_ENV_VARS). Returns
+    {"market_news": [...], "movements": [...], "stock_news": [...]}; each value is a list of
+    self-contained blocks, never split across two Telegram messages within its own channel (see
+    chunk_blocks() below) -- a real AI summary (2026-08-27 addition) can run 400-600 real
+    characters and 8 real simultaneous movers (a real, observed 2026-09-01 case) pushes a combined
+    digest well past Telegram's 4096-char single-message limit, hence both the per-channel split
+    and the chunking."""
     header = ["<b>Market Pulse</b> (cloud, independent of local machine)\n", "<b>Broad market:</b>"]
     for tk in MARKET_CONTEXT:
         q = get_quote(tk)
@@ -207,7 +233,7 @@ def build_digest_blocks():
             header.append(f"  {label}: {q['price']:.2f} ({q['pct']:+.2f}%)")
         else:
             header.append(f"  {tk}: no real quote available this run")
-    blocks = ["\n".join(header)]
+    market_news_blocks = ["\n".join(header)]
 
     movers = []
     for tk in WATCHLIST:
@@ -215,23 +241,34 @@ def build_digest_blocks():
         if q and abs(q["pct"]) >= MOVER_THRESHOLD_PCT:
             movers.append(q)
 
+    movements_blocks = []
+    stock_news_blocks = []
     if movers:
         movers.sort(key=lambda q: abs(q["pct"]), reverse=True)
-        blocks[0] += f"\n\n<b>Movers (|change| >= {MOVER_THRESHOLD_PCT:.0f}%):</b>"
+        mover_lines = [f"<b>Movers (|change| >= {MOVER_THRESHOLD_PCT:.0f}%):</b>"]
         for q in movers:
             arrow = "\U0001F4C8" if q["pct"] > 0 else "\U0001F4C9"
-            line = f"  {arrow} <b>{q['ticker']}</b>: ${q['price']:.2f} ({q['pct']:+.2f}%)"
-            article = get_top_article(q["ticker"])
-            if article:
-                summary = summarize_article(q["ticker"], q["pct"], article)
-                line += f"\n{summary}"
-                source_bit = f"{article['source']}" + (f" -- {article['link']}" if article["link"] else "")
-                line += f"\n<i>{source_bit}</i>"
-            blocks.append(line)
-    else:
-        blocks[0] += f"\n\nNo real holding crossed +/-{MOVER_THRESHOLD_PCT:.0f}% today."
+            mover_lines.append(f"  {arrow} <b>{q['ticker']}</b>: ${q['price']:.2f} ({q['pct']:+.2f}%)")
+        movements_blocks.append("\n".join(mover_lines))
 
-    return blocks
+        for q in movers:
+            article = get_top_article(q["ticker"])
+            if not article:
+                continue
+            summary = summarize_article(q["ticker"], q["pct"], article)
+            arrow = "\U0001F4C8" if q["pct"] > 0 else "\U0001F4C9"
+            source_bit = f"{article['source']}" + (f" -- {article['link']}" if article["link"] else "")
+            stock_news_blocks.append(
+                f"  {arrow} <b>{q['ticker']}</b> ({q['pct']:+.2f}%)\n{summary}\n<i>{source_bit}</i>"
+            )
+    else:
+        market_news_blocks[0] += f"\n\nNo real holding crossed +/-{MOVER_THRESHOLD_PCT:.0f}% today."
+
+    return {
+        "market_news": market_news_blocks,
+        "movements": movements_blocks,
+        "stock_news": stock_news_blocks,
+    }
 
 
 def chunk_blocks(blocks, max_chars=TELEGRAM_MAX_CHARS):
@@ -255,20 +292,26 @@ def chunk_blocks(blocks, max_chars=TELEGRAM_MAX_CHARS):
 
 
 def main():
-    blocks = build_digest_blocks()
-    chunks = chunk_blocks(blocks)
-    full_text = "\n\n".join(blocks)
+    digest = build_digest_blocks()
+    full_text = "\n\n".join(digest["market_news"] + digest["movements"] + digest["stock_news"])
     # Real robustness fix: a local Windows console (cp1252) can't print the real emoji used in
     # the digest -- GitHub Actions' Ubuntu runners are UTF-8 by default and won't hit this, but
     # printing for local testing/log visibility shouldn't crash the whole run either way.
     print(full_text.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8", errors="replace"))
-    print(f"\n{len(chunks)} real Telegram message(s) this run (digest is {len(full_text)} real chars).")
 
     all_ok = True
-    for i, chunk in enumerate(chunks, 1):
-        ok = send_telegram(chunk)
-        print(f"Telegram send {i}/{len(chunks)}: {'OK' if ok else 'FAILED'} ({len(chunk)} chars)")
-        all_ok = all_ok and ok
+    total_sent = 0
+    for channel, blocks in digest.items():
+        if not blocks:
+            continue
+        chunks = chunk_blocks(blocks)
+        total_sent += len(chunks)
+        for i, chunk in enumerate(chunks, 1):
+            ok = send_telegram(chunk, channel=channel)
+            print(f"Telegram send [{channel}] {i}/{len(chunks)}: {'OK' if ok else 'FAILED'} ({len(chunk)} chars)")
+            all_ok = all_ok and ok
+    print(f"\n{total_sent} real Telegram message(s) this run across "
+          f"{sum(1 for b in digest.values() if b)} channel(s) (digest is {len(full_text)} real chars).")
     if not all_ok:
         sys.exit(1)
 

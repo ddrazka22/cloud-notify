@@ -34,6 +34,36 @@ rate-limit or change without notice — if messages stop arriving, that's the fi
 4. Go to the **Actions** tab → "Market Pulse" workflow → **Run workflow** (manual trigger) to test
    it immediately, before waiting for the real schedule.
 
+## Splitting into separate chats (optional, 2026-09-02)
+
+By default everything still goes to `TELEGRAM_CHAT_ID`. To route broad market context, mover
+price/% lines, and mover news summaries into their own chats instead, add up to three more repo
+secrets (any you skip just keeps falling back to `TELEGRAM_CHAT_ID`):
+
+- `TELEGRAM_CHAT_ID_MARKET_NEWS` — broad market header (SPY/QQQ/VIX)
+- `TELEGRAM_CHAT_ID_MOVEMENTS` — mover ticker/price/% lines
+- `TELEGRAM_CHAT_ID_STOCK_NEWS` — mover news summaries
+
+**How to create a new chat and find its chat id** (Telegram only lets the bot's owner do this, not
+Claude):
+1. In Telegram, create a new group (or channel) for the category, e.g. "Portfolio – Movements".
+2. Add your existing bot to it as a member (search its @username the same way you'd add a person).
+3. Send any real message in that new group (Telegram won't register the chat until it has at
+   least one message).
+4. In a browser, go to `https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/getUpdates` (swap in your
+   real bot token). Find the entry for the new group's message and copy its `"chat":{"id": ...}`
+   value (group/channel ids are negative numbers).
+5. Set that number as `TELEGRAM_CHAT_ID_MOVEMENTS` (or `_MARKET_NEWS` / `_STOCK_NEWS`) as a GitHub
+   Actions repo secret here, AND as a local Windows env var (`setx TELEGRAM_CHAT_ID_MOVEMENTS
+   "<the id>"`, new terminal needed for it to take effect) — same name, same value, for the local
+   scripts that also route through it.
+
+The same three secrets/env vars, with the same names, are shared by the local scripts:
+`price_threshold_alerts.py` uses `TELEGRAM_CHAT_ID_MOVEMENTS`; `news_monitor.py` and
+`regime_classifier.py` use `TELEGRAM_CHAT_ID_MARKET_NEWS`/`TELEGRAM_CHAT_ID_STOCK_NEWS`;
+`daily_brief.py`/`weekly_brief.py` use `TELEGRAM_CHAT_ID_BRIEFS` (optional — briefs default to
+staying in your original `TELEGRAM_CHAT_ID` chat unless you also create a dedicated one).
+
 Once step 3 is done, this runs on GitHub's own servers on the real schedule in
 `.github/workflows/market_pulse.yml`, whether your computer is on, off, or in a lake.
 
