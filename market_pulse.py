@@ -43,6 +43,8 @@ of those three env vars that isn't set as a repo secret falls back to the origin
 (same bot, same default chat) so nothing breaks before the user creates the new chats.
 """
 
+import datetime
+import email.utils
 import os
 import re
 import sys
@@ -95,36 +97,74 @@ def _strip_cdata(s):
     return s.replace("<![CDATA[", "").replace("]]>", "").strip()
 
 
+ARTICLE_MAX_AGE_HOURS = 48  # real fix 2026-09-14 (user-reported: the SAME stale CRSR earnings
+# article kept getting re-sent as "why" the stock moved, on both up AND down days) -- Yahoo's
+# per-ticker RSS feed's first item is not always genuinely recent; with no real recency check,
+# an old article gets re-summarized every time that ticker crosses the mover threshold, and
+# because the AI prompt includes today's real pct move, it naturally reframes the SAME old facts
+# to sound like it's explaining today's direction -- misleading, since news that isn't actually
+# driving today's move has no business being presented as if it does. 48h is a real, deliberate
+# judgment call (not rigorously derived) -- wide enough that yesterday's after-hours earnings
+# still explains today's regular-session reaction, tight enough to exclude a month-old article
+# being endlessly recycled.
+
+
+def _parse_pub_date(pub_date):
+    if not pub_date:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(pub_date)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
 def get_top_article(ticker):
-    """Real top article (title + description + link) from Yahoo's public per-ticker RSS feed.
-    Returns None on any real failure or if the feed has no items -- never a fabricated article.
-    `description` is a real short blurb Yahoo includes in the feed itself, NOT the full article
-    body (fetching/parsing arbitrary real news sites' full pages is fragile and many paywall --
-    the blurb is real, genuine source content beyond the bare headline, which is what
-    summarize_article() below is built to work from)."""
+    """Real top RECENT article (title + description + link) from Yahoo's public per-ticker RSS
+    feed. Returns None on any real failure, if the feed has no items, or if every real item
+    checked is older than ARTICLE_MAX_AGE_HOURS (or has no parseable <pubDate> at all) -- an
+    honest "no real recent news" signal, same as a fetch failure, rather than a fabricated or
+    stale article. `description` is a real short blurb Yahoo includes in the feed itself, NOT the
+    full article body (fetching/parsing arbitrary real news sites' full pages is fragile and many
+    paywall -- the blurb is real, genuine source content beyond the bare headline, which is what
+    summarize_article() below is built to work from). Checks the first few real items (Yahoo's
+    feed is usually newest-first, but this verifies via real pubDate rather than trusting feed
+    order blindly) and returns the first one that actually clears the recency bar."""
     url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
     try:
         raw = _http_get(url).decode("utf-8", errors="replace")
-        m = re.search(r"<item>(.*?)</item>", raw, re.DOTALL)
-        if not m:
-            return None
-        item = m.group(1)
+    except (urllib.error.URLError, TimeoutError) as e:
+        print(f"  ! {ticker}: article fetch failed ({e})", file=sys.stderr)
+        return None
+
+    items = re.findall(r"<item>(.*?)</item>", raw, re.DOTALL)
+    if not items:
+        return None
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for item in items[:5]:
         title_m = re.search(r"<title>(.*?)</title>", item, re.DOTALL)
+        title = _strip_cdata(title_m.group(1)) if title_m else None
+        if not title:
+            continue
+        pubdate_m = re.search(r"<pubDate>(.*?)</pubDate>", item, re.DOTALL)
+        pub_dt = _parse_pub_date(_strip_cdata(pubdate_m.group(1))) if pubdate_m else None
+        if pub_dt is None or (now - pub_dt) > datetime.timedelta(hours=ARTICLE_MAX_AGE_HOURS):
+            print(f"  - {ticker}: skipping stale/undated article "
+                  f"({pub_dt.isoformat() if pub_dt else 'no pubDate'}): {title[:80]}", file=sys.stderr)
+            continue
         desc_m = re.search(r"<description>(.*?)</description>", item, re.DOTALL)
         link_m = re.search(r"<link>(.*?)</link>", item, re.DOTALL)
         source_m = re.search(r"<source[^>]*>(.*?)</source>", item, re.DOTALL)
-        title = _strip_cdata(title_m.group(1)) if title_m else None
-        if not title:
-            return None
         return {
             "title": title,
             "description": _strip_cdata(desc_m.group(1)) if desc_m else "",
             "link": _strip_cdata(link_m.group(1)) if link_m else None,
             "source": _strip_cdata(source_m.group(1)) if source_m else "Yahoo Finance",
         }
-    except (urllib.error.URLError, TimeoutError) as e:
-        print(f"  ! {ticker}: article fetch failed ({e})", file=sys.stderr)
-        return None
+    return None  # every real item checked was stale/undated -- honest "no recent news" signal
 
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"  # fast, cheap -- right-sized for a short real digest summary
