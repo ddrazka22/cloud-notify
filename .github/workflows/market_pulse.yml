@@ -22,6 +22,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Remembers which articles were already summarized+sent so the 4 daily runs don't re-pay for
+      # and re-send the same story. Cache keys are immutable, so each run saves under a unique key
+      # and restores the newest earlier one via the prefix.
+      - name: Restore already-sent article state
+        uses: actions/cache@v4
+        with:
+          path: pulse_state.json
+          key: pulse-state-${{ github.run_id }}
+          restore-keys: |
+            pulse-state-
       - name: Send real market pulse via Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

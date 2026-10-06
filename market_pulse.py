@@ -212,6 +212,39 @@ def summarize_article(ticker, pct, article):
         return f"(AI summary unavailable this run -- {e})"
 
 
+STATE_PATH = os.environ.get("MARKET_PULSE_STATE_PATH", "pulse_state.json")
+STATE_RETENTION_HOURS = 72  # article feeds only surface items <=48h old, so 72h always outlives them
+_NEWLY_SENT = {}  # article keys summarized this run; persisted only after Telegram confirms the send
+
+
+def _article_key(ticker, article):
+    return f"{ticker}|{article.get('link') or article['title']}"
+
+
+def _load_sent_state():
+    """{article_key: iso_utc_timestamp} of every article already summarized AND sent, pruned to
+    STATE_RETENTION_HOURS. Missing/corrupt file -> empty (worst case: one run re-sends, never a crash)."""
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            raw = json.load(f).get("sent", {})
+    except (OSError, ValueError):
+        return {}
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=STATE_RETENTION_HOURS)
+    kept = {}
+    for key, ts in raw.items():
+        try:
+            if datetime.datetime.fromisoformat(ts) >= cutoff:
+                kept[key] = ts
+        except (TypeError, ValueError):
+            continue
+    return kept
+
+
+def _save_sent_state(state):
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"sent": state}, f, indent=1)
+
+
 CHANNEL_ENV_VARS = {
     "market_news": "TELEGRAM_CHAT_ID_MARKET_NEWS",
     "movements": "TELEGRAM_CHAT_ID_MOVEMENTS",
@@ -291,11 +324,21 @@ def build_digest_blocks():
             mover_lines.append(f"  {arrow} <b>{q['ticker']}</b>: ${q['price']:.2f} ({q['pct']:+.2f}%)")
         movements_blocks.append("\n".join(mover_lines))
 
+        already_sent = _load_sent_state()
         for q in movers:
             article = get_top_article(q["ticker"])
             if not article:
                 continue
+            key = _article_key(q["ticker"], article)
+            if key in already_sent:
+                # Checked BEFORE summarize_article -- the point is not paying for the API call
+                # (or re-sending the same blurb) when an earlier run today already covered it.
+                print(f"  - {q['ticker']}: article already sent {already_sent[key]}, skipping "
+                      f"(no new news since): {article['title'][:80]}", file=sys.stderr)
+                continue
             summary = summarize_article(q["ticker"], q["pct"], article)
+            if not summary.startswith("(AI summary unavailable"):
+                _NEWLY_SENT[key] = datetime.datetime.now(datetime.timezone.utc).isoformat()
             arrow = "\U0001F4C8" if q["pct"] > 0 else "\U0001F4C9"
             source_bit = f"{article['source']}" + (f" -- {article['link']}" if article["link"] else "")
             stock_news_blocks.append(
@@ -353,7 +396,12 @@ def main():
     print(f"\n{total_sent} real Telegram message(s) this run across "
           f"{sum(1 for b in digest.values() if b)} channel(s) (digest is {len(full_text)} real chars).")
     if not all_ok:
-        sys.exit(1)
+        sys.exit(1)  # state NOT saved -- a failed send must be retried, not marked as delivered
+    if _NEWLY_SENT:
+        state = _load_sent_state()
+        state.update(_NEWLY_SENT)
+        _save_sent_state(state)
+        print(f"Recorded {len(_NEWLY_SENT)} newly sent article(s) in {STATE_PATH}.")
 
 
 if __name__ == "__main__":
