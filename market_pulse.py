@@ -221,14 +221,18 @@ def _article_key(ticker, article):
     return f"{ticker}|{article.get('link') or article['title']}"
 
 
+def _read_state_file():
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def _load_sent_state():
     """{article_key: iso_utc_timestamp} of every article already summarized AND sent, pruned to
     STATE_RETENTION_HOURS. Missing/corrupt file -> empty (worst case: one run re-sends, never a crash)."""
-    try:
-        with open(STATE_PATH, encoding="utf-8") as f:
-            raw = json.load(f).get("sent", {})
-    except (OSError, ValueError):
-        return {}
+    raw = _read_state_file().get("sent", {})
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=STATE_RETENTION_HOURS)
     kept = {}
     for key, ts in raw.items():
@@ -240,9 +244,43 @@ def _load_sent_state():
     return kept
 
 
-def _save_sent_state(state):
+_NEWLY_ANNOUNCED = {}  # mover keys shown in the movements chat this run; persisted like _NEWLY_SENT
+
+
+def _trading_date():
+    """US/Eastern calendar date, so 'already announced today' resets at midnight ET rather than
+    8 PM ET (UTC midnight) -- runs land as late as ~8 PM ET and must still count as the same day."""
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _mover_key(ticker):
+    return f"{_trading_date()}|{ticker}"
+
+
+def _load_mover_state():
+    """{'<ET date>|TICKER': {'pct': last announced % move, 'ts': iso}} for TODAY only -- a mover
+    that crosses the threshold again tomorrow is news again, so older days are dropped."""
+    today = _trading_date() + "|"
+    return {k: v for k, v in _read_state_file().get("movers", {}).items() if k.startswith(today)}
+
+
+def _save_state(sent, movers):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"sent": state}, f, indent=1)
+        json.dump({"sent": sent, "movers": movers}, f, indent=1)
+
+
+def should_reannounce(ticker, last_pct, new_pct):
+    """A mover already shown in the movements chat today crossed the threshold again. Return True
+    to post it a second time (the line will show the earlier % for context), False to stay quiet."""
+    # A reversal (up -> down or down -> up) or a further swing of one full threshold step since
+    # the LAST announcement. With only ~4 runs a day, anything tighter than that would mostly
+    # re-announce noise; last_pct is updated on each re-announce, so steps compound (+4 -> +7 -> +10).
+    flipped = (last_pct > 0) != (new_pct > 0)
+    return flipped or abs(new_pct - last_pct) >= MOVER_THRESHOLD_PCT
 
 
 CHANNEL_ENV_VARS = {
@@ -318,11 +356,22 @@ def build_digest_blocks():
     stock_news_blocks = []
     if movers:
         movers.sort(key=lambda q: abs(q["pct"]), reverse=True)
+        announced = _load_mover_state()
         mover_lines = [f"<b>Movers (|change| >= {MOVER_THRESHOLD_PCT:.0f}%):</b>"]
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
         for q in movers:
+            key = _mover_key(q["ticker"])
+            prev = announced.get(key)
+            if prev is not None and not should_reannounce(q["ticker"], prev["pct"], q["pct"]):
+                print(f"  - {q['ticker']}: mover already announced today at {prev['pct']:+.2f}%, "
+                      f"skipping ({q['pct']:+.2f}% now)", file=sys.stderr)
+                continue
             arrow = "\U0001F4C8" if q["pct"] > 0 else "\U0001F4C9"
-            mover_lines.append(f"  {arrow} <b>{q['ticker']}</b>: ${q['price']:.2f} ({q['pct']:+.2f}%)")
-        movements_blocks.append("\n".join(mover_lines))
+            earlier = f", was {prev['pct']:+.2f}% earlier" if prev is not None else ""
+            mover_lines.append(f"  {arrow} <b>{q['ticker']}</b>: ${q['price']:.2f} ({q['pct']:+.2f}%{earlier})")
+            _NEWLY_ANNOUNCED[key] = {"pct": q["pct"], "ts": now_iso}
+        if len(mover_lines) > 1:
+            movements_blocks.append("\n".join(mover_lines))
 
         already_sent = _load_sent_state()
         for q in movers:
@@ -397,11 +446,14 @@ def main():
           f"{sum(1 for b in digest.values() if b)} channel(s) (digest is {len(full_text)} real chars).")
     if not all_ok:
         sys.exit(1)  # state NOT saved -- a failed send must be retried, not marked as delivered
-    if _NEWLY_SENT:
-        state = _load_sent_state()
-        state.update(_NEWLY_SENT)
-        _save_sent_state(state)
-        print(f"Recorded {len(_NEWLY_SENT)} newly sent article(s) in {STATE_PATH}.")
+    if _NEWLY_SENT or _NEWLY_ANNOUNCED:
+        sent = _load_sent_state()
+        sent.update(_NEWLY_SENT)
+        movers = _load_mover_state()
+        movers.update(_NEWLY_ANNOUNCED)
+        _save_state(sent, movers)
+        print(f"Recorded {len(_NEWLY_SENT)} newly sent article(s) and {len(_NEWLY_ANNOUNCED)} "
+              f"announced mover(s) in {STATE_PATH}.")
 
 
 if __name__ == "__main__":
