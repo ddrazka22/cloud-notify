@@ -221,6 +221,32 @@ def _article_key(ticker, article):
     return f"{ticker}|{article.get('link') or article['title']}"
 
 
+SAME_STORY_THRESHOLD = 0.5  # word-overlap (Jaccard) at/above which two headlines are one story --
+# matches scripts/news_monitor.py's DUPLICATE_SIMILARITY_THRESHOLD. Real 2026-10-09 case this exists
+# for: Yahoo carried CrowdStrike's Tutanota mini-tender notice as two articles with different URLs
+# (overlap 0.73) and the link-only check sent both; unrelated same-ticker headlines scored 0.04-0.13.
+_STORY_STOPWORDS = {"the", "a", "an", "of", "to", "by", "and", "in", "on", "for", "is", "as", "at",
+                    "with", "its", "it", "that", "this", "from", "stock", "stocks", "shares"}
+_NEWLY_SENT_TITLES = {}  # article_key -> headline, persisted alongside _NEWLY_SENT
+
+
+def _story_words(title):
+    words = re.findall(r"[a-z0-9]+", title.lower().replace("'s", ""))
+    return {w for w in words if len(w) > 1 and w not in _STORY_STOPWORDS}
+
+
+def _same_story_title(title, earlier_titles):
+    """The first earlier headline that reads as the same story as `title`, else None."""
+    mine = _story_words(title)
+    if not mine:
+        return None
+    for other in earlier_titles:
+        theirs = _story_words(other)
+        if theirs and len(mine & theirs) / len(mine | theirs) >= SAME_STORY_THRESHOLD:
+            return other
+    return None
+
+
 def _read_state_file():
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
@@ -268,9 +294,19 @@ def _load_mover_state():
     return {k: v for k, v in _read_state_file().get("movers", {}).items() if k.startswith(today)}
 
 
-def _save_state(sent, movers):
+def _load_sent_titles(sent):
+    """{ticker: [headline, ...]} for articles still in the pruned `sent` set. Older state files
+    have no 'titles' -- those articles simply get link-only protection, as before."""
+    by_ticker = {}
+    for key, title in _read_state_file().get("titles", {}).items():
+        if key in sent:
+            by_ticker.setdefault(key.split("|", 1)[0], []).append(title)
+    return by_ticker
+
+
+def _save_state(sent, movers, titles):
     with open(STATE_PATH, "w", encoding="utf-8") as f:
-        json.dump({"sent": sent, "movers": movers}, f, indent=1)
+        json.dump({"sent": sent, "movers": movers, "titles": titles}, f, indent=1)
 
 
 def should_reannounce(ticker, last_pct, new_pct):
@@ -374,6 +410,7 @@ def build_digest_blocks():
             movements_blocks.append("\n".join(mover_lines))
 
         already_sent = _load_sent_state()
+        sent_titles = _load_sent_titles(already_sent)
         for q in movers:
             article = get_top_article(q["ticker"])
             if not article:
@@ -385,9 +422,19 @@ def build_digest_blocks():
                 print(f"  - {q['ticker']}: article already sent {already_sent[key]}, skipping "
                       f"(no new news since): {article['title'][:80]}", file=sys.stderr)
                 continue
+            twin = _same_story_title(article["title"], sent_titles.get(q["ticker"], []))
+            if twin:
+                # Different link, same story (a wire notice carried by two outlets). Remembered
+                # too, so later runs hit the cheap link check instead of re-comparing headlines.
+                print(f"  - {q['ticker']}: same story as one already sent ('{twin[:60]}'), skipping: "
+                      f"{article['title'][:80]}", file=sys.stderr)
+                _NEWLY_SENT[key] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                _NEWLY_SENT_TITLES[key] = article["title"]
+                continue
             summary = summarize_article(q["ticker"], q["pct"], article)
             if not summary.startswith("(AI summary unavailable"):
                 _NEWLY_SENT[key] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                _NEWLY_SENT_TITLES[key] = article["title"]
             arrow = "\U0001F4C8" if q["pct"] > 0 else "\U0001F4C9"
             source_bit = f"{article['source']}" + (f" -- {article['link']}" if article["link"] else "")
             stock_news_blocks.append(
@@ -449,9 +496,11 @@ def main():
     if _NEWLY_SENT or _NEWLY_ANNOUNCED:
         sent = _load_sent_state()
         sent.update(_NEWLY_SENT)
+        titles = {k: v for k, v in _read_state_file().get("titles", {}).items() if k in sent}
+        titles.update(_NEWLY_SENT_TITLES)
         movers = _load_mover_state()
         movers.update(_NEWLY_ANNOUNCED)
-        _save_state(sent, movers)
+        _save_state(sent, movers, titles)
         print(f"Recorded {len(_NEWLY_SENT)} newly sent article(s) and {len(_NEWLY_ANNOUNCED)} "
               f"announced mover(s) in {STATE_PATH}.")
 
