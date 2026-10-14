@@ -169,13 +169,30 @@ def get_top_article(ticker):
 
 ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"  # fast, cheap -- right-sized for a short real digest summary
 
+# Tightened 2026-10-14 (user-requested). A 2026-10-09 CRWD summary said a tender-offer rejection
+# "likely contributed to today's gain" and another said an analyst upgrade "likely reflects optimism
+# about ... recent operational improvements" -- neither was in the source. The model only ever sees a
+# headline plus a short blurb, and the old prompt asked for "why it's relevant" while also being
+# handed the day's % move, so it filled the gaps with invented causes. Facts only now.
 SUMMARY_SYSTEM_PROMPT = (
     "You write short, factual summaries of financial news for a personal portfolio-alert digest. "
-    "For the real article given, write 2-3 sentences in your OWN WORDS covering: what happened, "
-    "any real numbers/figures involved, and why it's relevant to the given ticker or macro "
-    "category. Never copy or closely paraphrase the source's original sentences -- synthesize the "
-    "real facts into your own genuinely different phrasing. No preamble, no headline restatement, "
-    "just the real summary itself, plain text, no markdown."
+    "You are given ONLY a headline and a short blurb, never the full article, so work strictly "
+    "from those two pieces of text. Write 1-3 sentences in your OWN WORDS: what happened, who is "
+    "involved, and any specific numbers, dates or prices that appear in the text. Use fewer "
+    "sentences when the text has little to say -- never pad.\n"
+    "Hard rules:\n"
+    "- State only what the text says. Do not add background, motives, or consequences that are "
+    "not in it, and do not define or explain terms from general knowledge.\n"
+    "- Do NOT explain or speculate about why the stock moved today. The day's move is given "
+    "only so you know which ticker is in play; never link the news to it unless the text itself "
+    "says the news caused the move.\n"
+    "- No hedging filler such as 'likely', 'may', 'could', 'suggests', 'signals', 'reflects', or "
+    "'investors viewed'. If something is not stated, leave it out.\n"
+    "- Never invent or round figures. If the text gives none, give none.\n"
+    "- If the headline and blurb are not actually about the given ticker, say so in one short "
+    "sentence instead of forcing a connection.\n"
+    "Never copy or closely paraphrase the source's sentences. No preamble, no headline "
+    "restatement, plain text, no markdown."
 )
 
 
@@ -188,7 +205,7 @@ def summarize_article(ticker, pct, article):
         return "(AI summary unavailable -- ANTHROPIC_API_KEY not set as a repo secret)"
 
     user_content = (
-        f"Ticker: {ticker} (today's move: {pct:+.2f}%)\n"
+        f"Ticker: {ticker} (today's move: {pct:+.2f}% -- context only, do not explain it)\n"
         f"Headline: {article['title']}\n"
         f"Source blurb: {article['description'] or '(no real blurb available, work from the headline)'}"
     )
